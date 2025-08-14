@@ -3842,6 +3842,19 @@ int main(int argc, char ** argv) {
             }
         }
 
+        // Azure-style API key headers
+        {
+            const char * azure_key_headers[] = {"api-key", "Api-Key", "x-api-key", "X-Api-Key"};
+            for (const auto & header_name : azure_key_headers) {
+                auto key_header = req.get_header_value(header_name);
+                if (!key_header.empty()) {
+                    if (std::find(params.api_keys.begin(), params.api_keys.end(), key_header) != params.api_keys.end()) {
+                        return true; // API key is valid
+                    }
+                }
+            }
+        }
+
         // API key is invalid or not provided
         res_error(res, format_error_response("Invalid API Key", ERROR_TYPE_AUTHENTICATION));
 
@@ -4399,6 +4412,25 @@ int main(int argc, char ** argv) {
             OAICOMPAT_TYPE_COMPLETION);
     };
 
+    // Azure-compatible completions endpoint
+    // Path: /openai/deployments/:deployment_id/completions?api-version=...
+    const auto handle_completions_oai_azure = [&handle_completions_impl](const httplib::Request & req, httplib::Response & res) {
+        json data = oaicompat_completion_params_parse(json::parse(req.body));
+        std::vector<raw_buffer> files; // dummy
+
+        if (req.path_params.count("deployment_id")) {
+            data["model"] = req.path_params.at("deployment_id");
+        }
+
+        handle_completions_impl(
+            SERVER_TASK_TYPE_COMPLETION,
+            data,
+            files,
+            req.is_connection_closed,
+            res,
+            OAICOMPAT_TYPE_COMPLETION);
+    };
+
     const auto handle_infill = [&ctx_server, &res_error, &handle_completions_impl](const httplib::Request & req, httplib::Response & res) {
         // check model compatibility
         std::string err;
@@ -4497,6 +4529,31 @@ int main(int argc, char ** argv) {
             OAICOMPAT_TYPE_CHAT);
     };
 
+    // Azure-compatible chat completions endpoint
+    // Path: /openai/deployments/:deployment_id/chat/completions?api-version=...
+    const auto handle_chat_completions_azure = [&ctx_server, &handle_completions_impl](const httplib::Request & req, httplib::Response & res) {
+        LOG_DBG("request (azure chat): %s\n", req.body.c_str());
+
+        auto body = json::parse(req.body);
+        std::vector<raw_buffer> files;
+        json data = oaicompat_chat_params_parse(
+            body,
+            ctx_server.oai_parser_opt,
+            files);
+
+        if (req.path_params.count("deployment_id")) {
+            data["model"] = req.path_params.at("deployment_id");
+        }
+
+        handle_completions_impl(
+            SERVER_TASK_TYPE_COMPLETION,
+            data,
+            files,
+            req.is_connection_closed,
+            res,
+            OAICOMPAT_TYPE_CHAT);
+    };
+
     // same with handle_chat_completions, but without inference part
     const auto handle_apply_template = [&ctx_server, &res_ok](const httplib::Request & req, httplib::Response & res) {
         auto body = json::parse(req.body);
@@ -4551,6 +4608,34 @@ int main(int argc, char ** argv) {
         };
 
         res_ok(res, models);
+    };
+
+    // Minimal Azure-compatible deployments listing
+    // Path: /openai/deployments?api-version=...
+    const auto handle_azure_deployments = [&params, &ctx_server, &state, &res_ok](const httplib::Request &, httplib::Response & res) {
+        server_state current_state = state.load();
+        json model_meta = nullptr;
+        if (current_state == SERVER_STATE_READY) {
+            model_meta = ctx_server.model_meta();
+        }
+
+        const std::string deployment_id = params.model_alias.empty() ? params.model.path : params.model_alias;
+
+        json deployments = {
+            {"object", "list"},
+            {"data", json::array({
+                json{
+                    {"id", deployment_id},
+                    {"object", "deployment"},
+                    {"model", deployment_id},
+                    {"owner", "llamacpp"},
+                    {"status", "succeeded"},
+                    {"meta", model_meta},
+                }
+            })}
+        };
+
+        res_ok(res, deployments);
     };
 
     const auto handle_tokenize = [&ctx_server, &res_ok](const httplib::Request & req, httplib::Response & res) {
@@ -4714,6 +4799,12 @@ int main(int argc, char ** argv) {
     };
 
     const auto handle_embeddings_oai = [&handle_embeddings_impl](const httplib::Request & req, httplib::Response & res) {
+        handle_embeddings_impl(req, res, OAICOMPAT_TYPE_EMBEDDING);
+    };
+
+    // Azure-compatible embeddings endpoint
+    // Path: /openai/deployments/:deployment_id/embeddings?api-version=...
+    const auto handle_embeddings_azure = [&handle_embeddings_impl](const httplib::Request & req, httplib::Response & res) {
         handle_embeddings_impl(req, res, OAICOMPAT_TYPE_EMBEDDING);
     };
 
@@ -4890,17 +4981,23 @@ int main(int argc, char ** argv) {
     svr->Post(params.api_prefix + "/api/show",            handle_api_show);
     svr->Get (params.api_prefix + "/models",              handle_models); // public endpoint (no API key check)
     svr->Get (params.api_prefix + "/v1/models",           handle_models); // public endpoint (no API key check)
+    // Azure-compatible deployments list (public)
+    svr->Get (params.api_prefix + "/openai/deployments",  handle_azure_deployments);
     svr->Get (params.api_prefix + "/api/tags",            handle_models); // ollama specific endpoint. public endpoint (no API key check)
     svr->Post(params.api_prefix + "/completion",          handle_completions); // legacy
     svr->Post(params.api_prefix + "/completions",         handle_completions);
     svr->Post(params.api_prefix + "/v1/completions",      handle_completions_oai);
+    // Azure-compatible routes
+    svr->Post(params.api_prefix + "/openai/deployments/:deployment_id/completions",      handle_completions_oai_azure);
     svr->Post(params.api_prefix + "/chat/completions",    handle_chat_completions);
     svr->Post(params.api_prefix + "/v1/chat/completions", handle_chat_completions);
+    svr->Post(params.api_prefix + "/openai/deployments/:deployment_id/chat/completions", handle_chat_completions_azure);
     svr->Post(params.api_prefix + "/api/chat",            handle_chat_completions); // ollama specific endpoint
     svr->Post(params.api_prefix + "/infill",              handle_infill);
     svr->Post(params.api_prefix + "/embedding",           handle_embeddings); // legacy
     svr->Post(params.api_prefix + "/embeddings",          handle_embeddings);
     svr->Post(params.api_prefix + "/v1/embeddings",       handle_embeddings_oai);
+    svr->Post(params.api_prefix + "/openai/deployments/:deployment_id/embeddings",       handle_embeddings_azure);
     svr->Post(params.api_prefix + "/rerank",              handle_rerank);
     svr->Post(params.api_prefix + "/reranking",           handle_rerank);
     svr->Post(params.api_prefix + "/v1/rerank",           handle_rerank);
